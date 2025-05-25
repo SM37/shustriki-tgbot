@@ -25,7 +25,7 @@ from aiogram.types import TelegramObject
 from aiogram.exceptions import TelegramForbiddenError
 from typing import Callable, Dict, Any
 
-from config import BOT_TOKEN, CHANNEL_URLS, CHANNEL_IDS, SPREADSHEET_NAME
+from config import BOT_TOKEN, CHANNEL_ID, CHANNEL_URL, SPREADSHEET_NAME
 
 import asyncio
 import logging
@@ -88,56 +88,66 @@ qr_links = {
 logging.basicConfig(level=logging.INFO)
 
 class SubscriptionMiddleware(BaseMiddleware):
-    def __init__(self, channel_ids: List[int], channel_urls: Dict[int, str]):
-        self.channel_ids = channel_ids
-        self.channel_urls = channel_urls
+    """
+    Проверяет подписку пользователя на единственный обязательный канал.
+    """
+    def __init__(self, channel_id: int, channel_url: str):
+        self.channel_id = channel_id
+        self.channel_url = channel_url
         super().__init__()
 
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Any],
         event: TelegramObject,
-        data: Dict[str, Any]
+        data: Dict[str, Any],
     ) -> Any:
         bot = data["bot"]
         user = data.get("event_from_user")
 
+        # у апдейтов без user (чат-боты, сервисные) подписка не важна
         if not user:
             return await handler(event, data)
 
-        not_subscribed_channels = []
-
-        for channel_id in self.channel_ids:
-            try:
-                member = await bot.get_chat_member(chat_id=channel_id, user_id=user.id)
-                if member.status == "left":
-                    not_subscribed_channels.append(channel_id)
-            except TelegramForbiddenError:
-                logging.warning(f"Бот не может проверить канал {channel_id} — нет прав администратора.")
-                continue
-            except Exception as e:
-                logging.error(f"Ошибка при проверке подписки на канал {channel_id}: {e}")
-                continue
-
-        if not_subscribed_channels:
-            buttons = [
-                [InlineKeyboardButton(text="📢 Подписаться", url=self.channel_urls[channel_id])]
-                for channel_id in not_subscribed_channels
-            ]
-            buttons.append([InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_subscription")])
-
+        try:
+            member = await bot.get_chat_member(
+                chat_id=self.channel_id,
+                user_id=user.id
+            )
+            if member.status == "left":
+                raise ValueError("not subscribed")
+        except Exception:
+            # любой сбой трактуем как отсутствие подписки
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📢 Подписаться",
+                            url=self.channel_url,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Проверить подписку",
+                            callback_data="check_subscription",
+                        )
+                    ],
+                ]
+            )
             await bot.send_message(
                 chat_id=user.id,
                 text=(
                     "🔒 <b>Доступ ограничен</b>\n\n"
-                    "Вы не подписались на все необходимые каналы.\n"
-                    "Пожалуйста, подпишитесь и нажмите <b>🔄 Проверить подписку</b>."
+                    "Вы не подписались на обязательный канал.\n"
+                    "Пожалуйста, подпишитесь и нажмите "
+                    "<b>🔄 Проверить подписку</b>."
                 ),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-                parse_mode="HTML"
+                reply_markup=kb,
+                parse_mode="HTML",
             )
-            return
+            return  # прерываем цепочку хэндлеров
 
+        # подписка есть → продолжаем
         return await handler(event, data)
 
 import asyncio
@@ -148,9 +158,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 async def connect_to_sheets(message: Message, creds_path: str, spreadsheet_id: str, sheet_name: str):
     loading_texts = [
-        "⏳ Пожалуйста, подождите.",
-        "⏳ Пожалуйста, подождите..",
-        "⏳ Пожалуйста, подождите..."
+        "⏳",
+        "⏳",
+        "⏳"
     ]
 
     # Первое сообщение
@@ -217,31 +227,26 @@ async def send_main_menu(user_id: int, bot: Bot):
 
 @dp.callback_query(F.data == "check_subscription")
 async def check_subscription_again(callback: CallbackQuery, bot: Bot, state: FSMContext):
-    not_subscribed_channels = []
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=callback.from_user.id)
+        if member.status == "left":
+            raise ValueError("Not subscribed")
+    except Exception as e:
+        logging.error(f"Ошибка при повторной проверке подписки на канал {CHANNEL_ID}: {e}")
 
-    for channel_id in CHANNEL_IDS:
-        try:
-            member = await bot.get_chat_member(chat_id=channel_id, user_id=callback.from_user.id)
-            if member.status == "left":
-                not_subscribed_channels.append(channel_id)
-        except TelegramForbiddenError:
-            logging.warning(f"Бот не может проверить канал {channel_id} — нет прав администратора.")
-        except Exception as e:
-            logging.error(f"Ошибка при повторной проверке подписки на канал {channel_id}: {e}")
-
-    if not_subscribed_channels:
         buttons = [
-            [InlineKeyboardButton(text="📢 Подписаться", url=CHANNEL_URLS[channel_id])]
-            for channel_id in not_subscribed_channels
+            [InlineKeyboardButton(text="📢 Подписаться", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_subscription")]
         ]
-        buttons.append([InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_subscription")])
 
         await callback.message.edit_text(
-            "❗ Вы ещё не подписались на все каналы!\n\nПожалуйста, подпишитесь и повторно нажмите кнопку ниже.",
+            "❗ Вы ещё не подписались на канал!\n\n"
+            "Пожалуйста, подпишитесь и повторно нажмите кнопку ниже.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
         return
 
+    # подписка подтверждена
     await state.clear()
     await callback.message.delete()
     await send_main_menu(callback.from_user.id, bot)
@@ -755,5 +760,5 @@ async def back_to_menu(message: types.Message, state: FSMContext, bot: Bot):
 # --- Запуск бота ---
 
 if __name__ == "__main__":
-    dp.message.middleware(SubscriptionMiddleware(CHANNEL_IDS, CHANNEL_URLS))
+    dp.message.middleware(SubscriptionMiddleware(CHANNEL_ID, CHANNEL_URL))
     asyncio.run(dp.start_polling(bot))
